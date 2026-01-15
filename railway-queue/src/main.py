@@ -1,11 +1,13 @@
 """
 Railway Queue Service - Unified Entry Point
 
-This file starts both:
-1. FastAPI webhook server (foreground) - Railway detects this and exposes public URL
-2. Queue worker (background asyncio task) - Processes jobs from Redis
+Starts:
+1. FastAPI webhook server (foreground) → Railway exposes public URL
+2. Queue worker (background asyncio task) → processes Redis jobs
 
-Railway only exposes public URLs when an HTTP server is running in the foreground.
+IMPORTANT:
+- Railway only exposes a public URL if an HTTP server runs in foreground
+- Queue worker must NOT block the event loop
 """
 
 import os
@@ -14,11 +16,12 @@ import logging
 from contextlib import asynccontextmanager
 from typing import Optional
 
-import uvicorn
 from fastapi import FastAPI
+import uvicorn
 
-from webhook import router as webhook_router
-from worker import QueueWorker
+# ✅ ABSOLUTE IMPORTS (CRITICAL FOR RAILWAY)
+from src.webhook import router as webhook_router
+from src.worker import QueueWorker
 
 # --------------------------------------------------
 # Logging
@@ -30,7 +33,7 @@ logging.basicConfig(
 logger = logging.getLogger("railway-queue-service")
 
 # --------------------------------------------------
-# Global worker instance and task
+# Global worker references
 # --------------------------------------------------
 worker: Optional[QueueWorker] = None
 worker_task: Optional[asyncio.Task] = None
@@ -39,48 +42,49 @@ worker_task: Optional[asyncio.Task] = None
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     """
-    FastAPI lifespan context manager.
-    Starts the queue worker when the app starts, stops it when the app shuts down.
+    FastAPI lifespan hook.
+    Starts QueueWorker in background on startup.
+    Cancels it cleanly on shutdown.
     """
     global worker, worker_task
-    
-    # Startup: Start queue worker as background task
+
     logger.info("🚀 Starting Railway Queue Service...")
+
+    # Start queue worker
     worker = QueueWorker()
-    
-    # Start worker in background
     worker_task = asyncio.create_task(worker.start())
+
     logger.info("✅ Queue worker started as background task")
-    
-    yield
-    
-    # Shutdown: Stop queue worker
-    logger.info("🛑 Shutting down Railway Queue Service...")
-    if worker_task:
-        worker_task.cancel()
-        try:
-            await worker_task
-        except asyncio.CancelledError:
-            pass
-    logger.info("✅ Queue worker stopped")
+
+    try:
+        yield
+    finally:
+        logger.info("🛑 Shutting down Railway Queue Service...")
+        if worker_task:
+            worker_task.cancel()
+            try:
+                await worker_task
+            except asyncio.CancelledError:
+                pass
+        logger.info("✅ Queue worker stopped")
 
 
 # --------------------------------------------------
-# Create FastAPI app with lifespan
+# FastAPI app
 # --------------------------------------------------
 app = FastAPI(
     title="Railway Queue Service",
-    description="Webhook endpoint + Queue worker for VideoAI",
+    description="Webhook endpoint + Redis queue worker for VideoAI",
     lifespan=lifespan,
 )
 
-# Include webhook routes
+# Register webhook routes
 app.include_router(webhook_router)
 
 
 @app.get("/health")
 async def health():
-    """Health check endpoint."""
+    """Health check endpoint"""
     return {
         "status": "healthy",
         "service": "railway-queue",
@@ -89,12 +93,13 @@ async def health():
 
 
 # --------------------------------------------------
-# Entry point
+# Local / direct execution (Railway-safe)
 # --------------------------------------------------
 if __name__ == "__main__":
     port = int(os.getenv("PORT", "8000"))
+
     uvicorn.run(
-        "main:app",
+        "src.main:app",   # ✅ MUST include src.
         host="0.0.0.0",
         port=port,
         log_level="info",
