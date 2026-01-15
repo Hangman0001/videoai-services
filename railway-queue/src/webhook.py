@@ -3,7 +3,7 @@ import json
 import time
 
 import redis
-from fastapi import FastAPI, HTTPException
+from fastapi import APIRouter, HTTPException
 
 REDIS_URL = os.getenv("REDIS_URL")
 if not REDIS_URL:
@@ -13,10 +13,11 @@ redis_client = redis.from_url(REDIS_URL, decode_responses=True)
 
 QUEUE_PENDING = "video_jobs:pending"
 
-app = FastAPI()
+# Export router instead of app
+router = APIRouter()
 
 
-@app.post("/webhook/video-uploaded")
+@router.post("/webhook/video-uploaded")
 async def video_uploaded(payload: dict):
     try:
         record = payload["record"]

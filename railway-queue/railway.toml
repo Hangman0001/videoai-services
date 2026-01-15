@@ -5,8 +5,9 @@ builder = "NIXPACKS"
 buildCommand = "pip install -r requirements.txt"
 
 [deploy]
-# Start FastAPI webhook AND queue worker together
-startCommand = "uvicorn src.webhook:app --host 0.0.0.0 --port $PORT & python src/worker.py"
+# Start unified service: FastAPI (foreground) + Queue Worker (background task)
+# Railway detects the HTTP server and exposes public URL
+startCommand = "uvicorn src.main:app --host 0.0.0.0 --port $PORT"
 
 # Restart if either process crashes
 restartPolicyType = "ON_FAILURE"
