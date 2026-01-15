@@ -1,0 +1,11 @@
+.env
+.env.*
+*.key
+*.pem
+*.secret
+credentials.txt
+video-ai-credentials/
+__pycache__/
+*.log
+node_modules/
+

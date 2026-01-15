@@ -1,0 +1,14 @@
+# Railway service configuration for Phase 2.2 Queue Worker
+
+[build]
+builder = "NIXPACKS"
+buildCommand = "pip install -r requirements.txt"
+
+[deploy]
+startCommand = "python src/worker.py"
+restartPolicyType = "ON_FAILURE"
+restartPolicyMaxRetries = 10
+
+[environment]
+REDIS_URL = "{{ .REDIS_URL }}"
+CLOUDFLARE_ROUTER_URL = "{{ .CLOUDFLARE_ROUTER_URL }}"
