@@ -203,6 +203,201 @@
 
 # if __name__ == "__main__":
 #     main()
+# import os
+# import json
+# import time
+# import asyncio
+# import logging
+# from typing import Dict, Any
+
+# import redis
+# import aiohttp
+
+# # --------------------------------------------------
+# # Logging
+# # --------------------------------------------------
+# logging.basicConfig(
+#     level=logging.INFO,
+#     format="%(asctime)s - %(levelname)s - %(message)s",
+# )
+# logger = logging.getLogger("queue-worker")
+
+# # --------------------------------------------------
+# # Environment
+# # --------------------------------------------------
+# REDIS_URL = os.getenv("REDIS_URL")
+# CLOUDFLARE_ROUTER_URL = os.getenv("CLOUDFLARE_ROUTER_URL")
+
+# if not REDIS_URL:
+#     raise RuntimeError("REDIS_URL is not set")
+
+# if not CLOUDFLARE_ROUTER_URL:
+#     raise RuntimeError("CLOUDFLARE_ROUTER_URL is not set")
+
+# # --------------------------------------------------
+# # Queue Names
+# # --------------------------------------------------
+# QUEUES = {
+#     "pending": "video_jobs:pending",
+#     "processing": "video_jobs:processing",
+#     "routed": "video_jobs:routed",
+#     "dead_letter": "video_jobs:dead_letter",
+#     "retry_delayed": "video_jobs:retry:delayed",
+# }
+
+# MAX_RETRIES = 5
+# RETRY_DELAYS = [1, 2, 4, 8, 16]  # seconds
+
+
+# class QueueWorker:
+#     def __init__(self):
+#         self.redis = redis.from_url(REDIS_URL, decode_responses=True)
+#         logger.info("Connected to Redis")
+
+#     # --------------------------------------------------
+#     # Main loop
+#     # --------------------------------------------------
+#     async def start(self):
+#         logger.info("🚀 Phase 2 Queue Worker started")
+#         logger.info(f"Router Worker: {CLOUDFLARE_ROUTER_URL}")
+
+#         while True:
+#             try:
+#                 job_data = self.redis.brpoplpush(
+#                     QUEUES["pending"],
+#                     QUEUES["processing"],
+#                     timeout=1,
+#                 )
+
+#                 if job_data:
+#                     job = json.loads(job_data)
+#                     await self.process_job(job)
+
+#                 await self.process_retry_queue()
+#                 await asyncio.sleep(0.1)
+
+#             except Exception as e:
+#                 logger.error(f"Worker loop error: {e}")
+#                 await asyncio.sleep(5)
+
+#     # --------------------------------------------------
+#     # Job processing
+#     # --------------------------------------------------
+#     async def process_job(self, job: Dict[str, Any]):
+#         job_id = job.get("id")
+#         retry_count = job.get("retry_count", 0)
+
+#         logger.info(f"Processing job {job_id} (attempt {retry_count + 1})")
+
+#         try:
+#             response = await self.call_router_worker(job)
+
+#             if not response.get("success"):
+#                 raise RuntimeError(response.get("error", "Router failure"))
+
+#             job["route"] = response["classification"]["route"]
+#             job["status"] = "routed"
+#             job["routed_at"] = time.time()
+
+#             self.redis.lpush(QUEUES["routed"], json.dumps(job))
+#             self.redis.lrem(QUEUES["processing"], 0, json.dumps(job))
+
+#             logger.info(f"Job {job_id} routed → {job['route']}")
+
+#         except Exception as e:
+#             logger.error(f"Job {job_id} failed: {e}")
+#             await self.handle_failure(job, str(e))
+
+#     # --------------------------------------------------
+#     # Router Worker call
+#     # --------------------------------------------------
+#     async def call_router_worker(self, job: Dict[str, Any]) -> Dict[str, Any]:
+#         payload = {
+#             "id": job.get("id"),
+#             "video_url": job.get("video_url"),
+#             "file_size_mb": job.get("file_size_mb"),
+#             "duration_seconds": job.get("duration_seconds"),
+#         }
+
+#         async with aiohttp.ClientSession() as session:
+#             try:
+#                 async with session.post(
+#                     CLOUDFLARE_ROUTER_URL,
+#                     json=payload,
+#                     timeout=30,
+#                 ) as resp:
+#                     if resp.status == 200:
+#                         return await resp.json()
+#                     return {
+#                         "success": False,
+#                         "error": f"HTTP {resp.status}",
+#                     }
+#             except asyncio.TimeoutError:
+#                 return {"success": False, "error": "Router timeout"}
+#             except Exception as e:
+#                 return {"success": False, "error": str(e)}
+
+#     # --------------------------------------------------
+#     # Failure & retry
+#     # --------------------------------------------------
+#     async def handle_failure(self, job: Dict[str, Any], error: str):
+#         job_id = job.get("id")
+#         retry_count = job.get("retry_count", 0)
+
+#         self.redis.lrem(QUEUES["processing"], 0, json.dumps(job))
+
+#         if retry_count < MAX_RETRIES:
+#             delay = RETRY_DELAYS[retry_count]
+#             retry_at = time.time() + delay
+
+#             job["retry_count"] = retry_count + 1
+#             job["last_error"] = error
+#             job["next_retry_at"] = retry_at
+
+#             self.redis.zadd(
+#                 QUEUES["retry_delayed"],
+#                 {json.dumps(job): retry_at},
+#             )
+
+#             logger.info(f"Retry scheduled for job {job_id} in {delay}s")
+
+#         else:
+#             job["status"] = "dead_letter"
+#             job["final_error"] = error
+#             job["failed_at"] = time.time()
+
+#             self.redis.lpush(QUEUES["dead_letter"], json.dumps(job))
+#             logger.error(f"Job {job_id} moved to dead_letter")
+
+#     # --------------------------------------------------
+#     # Retry queue
+#     # --------------------------------------------------
+#     async def process_retry_queue(self):
+#         now = time.time()
+#         jobs = self.redis.zrangebyscore(
+#             QUEUES["retry_delayed"],
+#             0,
+#             now,
+#         )
+
+#         for job_str in jobs:
+#             self.redis.lpush(QUEUES["pending"], job_str)
+#             self.redis.zrem(QUEUES["retry_delayed"], job_str)
+
+#             job = json.loads(job_str)
+#             logger.info(f"Retrying job {job.get('id')}")
+
+
+# # --------------------------------------------------
+# # Entry point
+# # --------------------------------------------------
+# async def main():
+#     worker = QueueWorker()
+#     await worker.start()
+
+
+# if __name__ == "__main__":
+#     asyncio.run(main())
 import os
 import json
 import time
@@ -223,10 +418,11 @@ logging.basicConfig(
 logger = logging.getLogger("queue-worker")
 
 # --------------------------------------------------
-# Environment
+# Environment variables
 # --------------------------------------------------
 REDIS_URL = os.getenv("REDIS_URL")
 CLOUDFLARE_ROUTER_URL = os.getenv("CLOUDFLARE_ROUTER_URL")
+HF_FARM_URL = os.getenv("HF_FARM_URL")
 
 if not REDIS_URL:
     raise RuntimeError("REDIS_URL is not set")
@@ -234,8 +430,11 @@ if not REDIS_URL:
 if not CLOUDFLARE_ROUTER_URL:
     raise RuntimeError("CLOUDFLARE_ROUTER_URL is not set")
 
+if not HF_FARM_URL:
+    raise RuntimeError("HF_FARM_URL is not set")
+
 # --------------------------------------------------
-# Queue Names
+# Queue names
 # --------------------------------------------------
 QUEUES = {
     "pending": "video_jobs:pending",
@@ -252,14 +451,15 @@ RETRY_DELAYS = [1, 2, 4, 8, 16]  # seconds
 class QueueWorker:
     def __init__(self):
         self.redis = redis.from_url(REDIS_URL, decode_responses=True)
-        logger.info("Connected to Redis")
+        logger.info("✅ Connected to Redis")
 
     # --------------------------------------------------
-    # Main loop
+    # Main worker loop
     # --------------------------------------------------
     async def start(self):
-        logger.info("🚀 Phase 2 Queue Worker started")
-        logger.info(f"Router Worker: {CLOUDFLARE_ROUTER_URL}")
+        logger.info("🚀 Queue Worker started")
+        logger.info(f"Router URL: {CLOUDFLARE_ROUTER_URL}")
+        logger.info(f"HF Farm URL: {HF_FARM_URL}")
 
         while True:
             try:
@@ -287,25 +487,52 @@ class QueueWorker:
         job_id = job.get("id")
         retry_count = job.get("retry_count", 0)
 
-        logger.info(f"Processing job {job_id} (attempt {retry_count + 1})")
+        logger.info(f"▶️ Processing job {job_id} (attempt {retry_count + 1})")
 
         try:
-            response = await self.call_router_worker(job)
+            # ----------------------------
+            # 1. Call Router Worker
+            # ----------------------------
+            router_response = await self.call_router_worker(job)
 
-            if not response.get("success"):
-                raise RuntimeError(response.get("error", "Router failure"))
+            if not router_response.get("success"):
+                raise RuntimeError(router_response.get("error", "Router failure"))
 
-            job["route"] = response["classification"]["route"]
-            job["status"] = "routed"
+            job["route"] = router_response["route"]
+            job["router_decision"] = router_response["decision"]
             job["routed_at"] = time.time()
 
+            logger.info(
+                f"🧠 Router selected {job['router_decision']['provider']} "
+                f"for job {job_id}"
+            )
+
+            # ----------------------------
+            # 2. Call HF Farm
+            # ----------------------------
+            hf_response = await self.call_hf_farm(job)
+
+            if not hf_response.get("success"):
+                raise RuntimeError(hf_response.get("error", "HF Farm failure"))
+
+            job["highlights"] = hf_response.get("highlights", [])
+            job["highlight_count"] = hf_response.get("highlight_count", 0)
+            job["ai_completed_at"] = time.time()
+            job["status"] = "completed"
+
+            # ----------------------------
+            # 3. Move to routed queue
+            # ----------------------------
             self.redis.lpush(QUEUES["routed"], json.dumps(job))
             self.redis.lrem(QUEUES["processing"], 0, json.dumps(job))
 
-            logger.info(f"Job {job_id} routed → {job['route']}")
+            logger.info(
+                f"✅ Job {job_id} completed "
+                f"({job['highlight_count']} highlights)"
+            )
 
         except Exception as e:
-            logger.error(f"Job {job_id} failed: {e}")
+            logger.error(f"❌ Job {job_id} failed: {e}")
             await self.handle_failure(job, str(e))
 
     # --------------------------------------------------
@@ -315,8 +542,9 @@ class QueueWorker:
         payload = {
             "id": job.get("id"),
             "video_url": job.get("video_url"),
-            "file_size_mb": job.get("file_size_mb"),
+            "file_size_mb": job.get("file_size_mb", 0),
             "duration_seconds": job.get("duration_seconds"),
+            "route": job.get("route"),
         }
 
         async with aiohttp.ClientSession() as session:
@@ -328,17 +556,49 @@ class QueueWorker:
                 ) as resp:
                     if resp.status == 200:
                         return await resp.json()
+
                     return {
                         "success": False,
-                        "error": f"HTTP {resp.status}",
+                        "error": f"Router HTTP {resp.status}",
                     }
+
             except asyncio.TimeoutError:
                 return {"success": False, "error": "Router timeout"}
             except Exception as e:
                 return {"success": False, "error": str(e)}
 
     # --------------------------------------------------
-    # Failure & retry
+    # HF Farm call
+    # --------------------------------------------------
+    async def call_hf_farm(self, job: Dict[str, Any]) -> Dict[str, Any]:
+        payload = {
+            "jobId": job.get("id"),
+            "video_url": job.get("video_url"),
+            "duration_seconds": job.get("duration_seconds"),
+        }
+
+        async with aiohttp.ClientSession() as session:
+            try:
+                async with session.post(
+                    HF_FARM_URL,
+                    json=payload,
+                    timeout=60,
+                ) as resp:
+                    if resp.status == 200:
+                        return await resp.json()
+
+                    return {
+                        "success": False,
+                        "error": f"HF Farm HTTP {resp.status}",
+                    }
+
+            except asyncio.TimeoutError:
+                return {"success": False, "error": "HF Farm timeout"}
+            except Exception as e:
+                return {"success": False, "error": str(e)}
+
+    # --------------------------------------------------
+    # Failure & retry handling
     # --------------------------------------------------
     async def handle_failure(self, job: Dict[str, Any], error: str):
         job_id = job.get("id")
@@ -359,7 +619,9 @@ class QueueWorker:
                 {json.dumps(job): retry_at},
             )
 
-            logger.info(f"Retry scheduled for job {job_id} in {delay}s")
+            logger.info(
+                f"🔁 Retry scheduled for job {job_id} in {delay}s"
+            )
 
         else:
             job["status"] = "dead_letter"
@@ -367,10 +629,10 @@ class QueueWorker:
             job["failed_at"] = time.time()
 
             self.redis.lpush(QUEUES["dead_letter"], json.dumps(job))
-            logger.error(f"Job {job_id} moved to dead_letter")
+            logger.error(f"☠️ Job {job_id} moved to dead_letter")
 
     # --------------------------------------------------
-    # Retry queue
+    # Retry queue processor
     # --------------------------------------------------
     async def process_retry_queue(self):
         now = time.time()
@@ -385,7 +647,7 @@ class QueueWorker:
             self.redis.zrem(QUEUES["retry_delayed"], job_str)
 
             job = json.loads(job_str)
-            logger.info(f"Retrying job {job.get('id')}")
+            logger.info(f"🔄 Retrying job {job.get('id')}")
 
 
 # --------------------------------------------------
